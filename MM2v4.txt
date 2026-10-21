@@ -7,19 +7,23 @@ local MAX_COINS = 50      -- reset when bag counter reaches this
 local FIRST_SPEED = 999   -- first coin of the round is a fast snap
 local NO_COIN_DELAY = 2   -- seconds with no coins left before auto reset
 local MENU_KEY = 0x70     -- F1
+local ANTI_AFK_INTERVAL = 60 -- seconds between anti-AFK mouse nudges
+local HEALTH_OFFSET = 0x184 -- Humanoid health offset for memory_write (changes when Roblox updates)
 local MAX_MISSES = 2      -- failed pickups in a row = bag is full, reset
 
-local coins = 0
 local first = true
-local collected = 0      -- highest coin count seen (GUI or our own count)
 local missed = 0         -- consecutive coins we reached but couldn't collect
 local lastResetTry = 0
 local noCoinSince = nil
 local status = "Starting"
-local roundOver = false
-local lastProgress = tick()
-local activeContainer = nil  -- coin container of the current round
-local lastGui = nil          -- last bag counter value read from the GUI
+local ownCollected = 0   -- coins WE picked up this life (never read from the GUI)
+local lifeChar = nil     -- character we last farmed with
+local lastContainerSeen = nil -- coin container from the previous step (map change detector)
+local ghostContainer, ghostStrikes = nil, 0 -- container whose coins never registered
+local lastEvent = "-"        -- shown in the menu: the last notable thing the script did
+local wasAlive = false
+local freezeUntil = 0        -- hold still while the game swaps maps / characters
+local heartbeat = tick()     -- updated by the farm loop; the watchdog restarts the loop if it stalls
 
 -- Settings (changed from the Drawing menu below)
 local cfg = {
@@ -54,8 +58,12 @@ end
 ------------------------------------------------------------
 -- Farm logic
 ------------------------------------------------------------
+-- pcall'd: reading a deleted instance (old map) can throw in an external VM
+local function getParent(o) return o.Parent end
 local function isValid(obj)
-    return obj ~= nil and obj.Parent ~= nil
+    if obj == nil then return false end
+    local ok, parent = pcall(getParent, obj)
+    return ok and parent ~= nil
 end
 
 -- Uses the "Alive" attribute; falls back to Humanoid health if it isn't set.
@@ -67,11 +75,6 @@ local function isAlive()
     local char = plr.Character
     local hum = char and char:FindFirstChild("Humanoid")
     return hum ~= nil and hum.Health > 0
-end
-
-local function getTimeLeft()
-    local rtp = workspace:FindFirstChild("RoundTimerPart")
-    return rtp and tonumber(rtp:GetAttribute("Time"))
 end
 
 local function dist(a, b)
@@ -108,13 +111,26 @@ local cachedContainer = nil
 local lastContainer = nil
 local lastScan = 0
 
--- Clears everything tied to the previous round/life.
-local function resetRoundState()
-    coins, collected, missed = 0, 0, 0
-    lastGui = nil
-    first = true
-    noCoinSince = nil
-    lastProgress = tick()
+-- Containers we are DONE with (we died / reset / round ended / coins don't register).
+-- A finished map can linger in workspace through the lobby and map voting, so it must
+-- never be farmed again. A brand new map's container is never in this list.
+local function evt(msg)
+    lastEvent = string.sub(tostring(msg), 1, 30)
+end
+
+local usedContainers = {}
+local function isUsed(c)
+    for _, u in ipairs(usedContainers) do
+        if u == c then return true end
+    end
+    return false
+end
+local function markUsed(c, why)
+    if c == nil or isUsed(c) then return end
+    usedContainers[#usedContainers + 1] = c
+    if #usedContainers > 12 then table.remove(usedContainers, 1) end
+    cachedContainer = nil
+    evt("used: " .. tostring(why))
 end
 
 local function hasCoins(container)
@@ -127,28 +143,35 @@ end
 -- Old maps can linger in workspace, so prefer a CoinContainer that really
 -- has coins in it, and re-scan whenever the cached one goes empty/stale.
 local function findCoinContainer()
-    if isValid(cachedContainer) then return cachedContainer end
+    if isValid(cachedContainer) and not isUsed(cachedContainer) then return cachedContainer end
     cachedContainer = nil
-    if tick() - lastScan < 0.5 then
-        return isValid(lastContainer) and lastContainer or nil
+    if tick() - lastScan < 1 then
+        return (isValid(lastContainer) and not isUsed(lastContainer)) and lastContainer or nil
     end
     lastScan = tick()
 
-    local fallback = nil
-    for _, obj in ipairs(workspace:GetChildren()) do
-        if obj.ClassName == "Model" then
-            local container = obj:FindFirstChild("CoinContainer")
-            if container then
-                if hasCoins(container) then
-                    cachedContainer, lastContainer = container, container
-                    return container
+    local found, fallback = nil, nil
+    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    if ok and kids then
+        for _, obj in ipairs(kids) do
+            pcall(function()
+                if found == nil and obj.ClassName == "Model" then
+                    local container = obj:FindFirstChild("CoinContainer")
+                    if container and not isUsed(container) then
+                        if hasCoins(container) then
+                            found = container
+                        else
+                            fallback = fallback or container
+                        end
+                    end
                 end
-                fallback = fallback or container
-            end
+            end)
+            if found then break end
         end
     end
-    cachedContainer, lastContainer = fallback, fallback or lastContainer
-    return fallback
+    local result = found or fallback
+    cachedContainer, lastContainer = result, result or lastContainer
+    return result
 end
 
 -- Tries Health = 0 first, then the Roblox menu reset, until the character dies.
@@ -157,85 +180,55 @@ local function resetCharacter()
     if not char then return false end
     local hum = char:FindFirstChildOfClass("Humanoid") or char:FindFirstChild("Humanoid")
 
-    -- 1) Health = 0
-    if hum then pcall(function() hum.Health = 0 end) end
+    -- 1) Health = 0, plus a direct memory write to the health offset (needs
+    --    "Unsafe LuaU Execution Allowed"; works while Roblox is unfocused)
+    if hum then
+        pcall(function() hum.Health = 0 end)
+        pcall(function()
+            if hum.Address then
+                memory_write("float", hum.Address + HEALTH_OFFSET, -10)
+            end
+        end)
+    end
     wait(0.5)
     if not isAlive() then return true end
 
-    -- 2) Roblox menu reset: Esc, R, Enter
-    pcall(function()
-        keypress(0x1B) wait(0.1) keyrelease(0x1B) wait(0.3)
-        keypress(0x52) wait(0.1) keyrelease(0x52) wait(0.3)
-        keypress(0x0D) wait(0.1) keyrelease(0x0D)
-    end)
-    for _ = 1, 20 do
-        wait(0.1)
-        if not isAlive() then return true end
+    -- 2) Fall into the void. Needs no keyboard and no window focus (position writes
+    --    are what the farming itself uses), so it works while Roblox is in the background.
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        for _ = 1, 40 do
+            heartbeat = tick()
+            local okp = pcall(function()
+                local p = hrp.Position
+                hrp.Position = Vector3.new(p.X, -2000, p.Z)
+            end)
+            if not okp then break end
+            wait(0.1)
+            if not isAlive() then return true end
+        end
+    end
+
+    -- 3) Roblox menu reset: Esc, R, Enter. Only when Roblox is the focused window,
+    --    otherwise these keys would be typed into whatever app you are looking at.
+    if isrbxactive() then
+        pcall(function()
+            keypress(0x1B) wait(0.1) keyrelease(0x1B) wait(0.3)
+            keypress(0x52) wait(0.1) keyrelease(0x52) wait(0.3)
+            keypress(0x0D) wait(0.1) keyrelease(0x0D)
+        end)
+        for _ = 1, 20 do
+            wait(0.1)
+            if not isAlive() then return true end
+        end
     end
     return false
-end
-
-------------------------------------------------------------
--- Coin bag reading (normal bag + candy/event bag)
-------------------------------------------------------------
-local function getBags()
-    local ok, bags = pcall(function()
-        return plr.PlayerGui.MainGUI.Game.CoinBags.Container
-    end)
-    return ok and bags or nil
-end
-
--- Reads the highest bag counter from the GUI. If the counter drops compared
--- to the last read, the bag was reset (new round), so our count follows it.
-local function readCoins()
-    local bags = getBags()
-    if bags then
-        pcall(function()
-            local guiMax = nil
-            for _, d in ipairs(bags:GetDescendants()) do
-                if d.Name == "Coins" and d:IsA("TextLabel") then
-                    local n = tonumber(string.match(tostring(d.Text), "%d+"))
-                    if n and (not guiMax or n > guiMax) then guiMax = n end
-                end
-            end
-            if guiMax then
-                -- bag counter dropped = new round / bag reset
-                if lastGui and guiMax < lastGui then collected = guiMax end
-                lastGui = guiMax
-                if guiMax > collected then collected = guiMax end
-            end
-        end)
-    end
-    return collected
-end
-
--- True when any visible bag label says "Full" (throttled, GUI scans are costly)
-local lastFullCheck, lastFullResult = 0, false
-local function bagFull()
-    local now = tick()
-    if now - lastFullCheck < 0.25 then return lastFullResult end
-    lastFullCheck = now
-
-    local full = false
-    local bags = getBags()
-    if bags then
-        pcall(function()
-            for _, d in ipairs(bags:GetDescendants()) do
-                if d:IsA("TextLabel") and d.Visible and string.find(tostring(d.Text), "Full") then
-                    full = true
-                    break
-                end
-            end
-        end)
-    end
-    lastFullResult = full
-    return full
 end
 
 local function getClosestCoin(container, origin)
     local best, bestDist = nil, math.huge
     for _, obj in ipairs(container:GetChildren()) do
-        if isValid(obj) and obj.Name == "Coin_Server" and obj:FindFirstChild("TouchInterest") then
+        if obj.Name == "Coin_Server" and obj:FindFirstChild("TouchInterest") then
             local d = dist(obj.Position, origin)
             if d < bestDist then
                 best, bestDist = obj, d
@@ -258,6 +251,7 @@ local function tween(hrp, coin, spd)
 
     while true do
         local now = tick()
+        heartbeat = now
 
         if not isValid(hrp) or not isValid(coin) or not getEnabled() then
             return false
@@ -297,12 +291,11 @@ local function doReset(reason)
     if not getAutoReset() or tick() - lastResetTry < 3 then
         return false
     end
-    -- never reset in lobby/intermission or while already dead
-    local t = getTimeLeft()
-    if (t and t <= 0) or not isAlive() then return false end
     lastResetTry = tick()
     status = "Resetting"
+    evt("reset: " .. tostring(reason))
     if resetCharacter() then
+        markUsed(lastContainerSeen, "reset")
         notify(reason .. ", reset done", "Coin Farm", 2)
         return true
     end
@@ -317,64 +310,77 @@ local function step()
         return wait(0.25)
     end
 
-    local timeLeft = getTimeLeft()
-    if timeLeft and timeLeft <= 0 then
-        if not roundOver then
-            roundOver = true
-            resetRoundState()
-            cachedContainer = nil
-        end
-        status = "Waiting for round"
-
-        -- Only idle if there is really nothing to farm
-        local cont = findCoinContainer()
-        local c = plr.Character
-        local h = c and c:FindFirstChild("HumanoidRootPart")
-        if not (cont and h and getClosestCoin(cont, h.Position)) then
-            return wait(0.5)
-        end
-    else
-        roundOver = false
-    end
-
     if not isAlive() then
-        first = true
-        collected, missed = 0, 0
-        lastGui = nil
-        noCoinSince = nil
+        markUsed(lastContainerSeen, "dead")
+        wasAlive = false
+        first, missed, ownCollected, noCoinSince = true, 0, 0, nil
         status = "Dead"
         return wait(0.25)
     end
 
-    coins = readCoins()
-
-    -- Bag full: the counter hit the max, a bag label says "Full", or we keep
-    -- reaching coins that won't get collected. Reset instead of teleporting
-    -- to the same coin.
-    if coins >= MAX_COINS or bagFull() or missed >= MAX_MISSES then
-        status = "Bag full"
-        doReset("Bag full")
-        return wait(0.5)
+    if not wasAlive then
+        wasAlive = true
+        freezeUntil = tick() + 2
+        evt("alive, settling")
     end
 
-    -- Watchdog: alive but nothing happening for 15s -> clear cached state
-    if tick() - lastProgress > 15 then
-        lastProgress = tick()
-        cachedContainer = nil
-        first = true
-        noCoinSince = nil
+    -- New character (new round / respawn): forget the old life
+    if plr.Character ~= lifeChar then
+        lifeChar = plr.Character
+        missed, ownCollected = 0, 0
+        first, noCoinSince, cachedContainer = true, nil, nil
     end
 
     local container = findCoinContainer()
-    if not container then
-        status = "No coin container"
+
+    -- Container changed or vanished = old map deleted / new one loaded: clean slate
+    if container ~= lastContainerSeen then
+        lastContainerSeen = container
+        missed, ownCollected = 0, 0
+        first, noCoinSince = true, nil
+        if container then
+            freezeUntil = tick() + 2
+            evt("new map, settling")
+        end
+    end
+
+    -- Give the game a moment after a map swap / respawn before touching anything
+    if tick() < freezeUntil then
+        status = "Settling"
+        return wait(0.2)
+    end
+
+    -- Reached coins twice but picked up nothing this life: not live coins (old map
+    -- left in the lobby). Three strikes, since a new map's coins can take a few
+    -- seconds to go live.
+    if missed >= MAX_MISSES and ownCollected == 0 then
+        if container == ghostContainer then
+            ghostStrikes = ghostStrikes + 1
+        else
+            ghostContainer, ghostStrikes = container, 1
+        end
+        missed = 0
+        if ghostStrikes >= 3 then
+            markUsed(container, "coins never registered, old map")
+            status = "Waiting for new map"
+        else
+            status = "Coins not live yet"
+            wait(3)
+        end
         return wait(0.25)
     end
 
-    -- New map/container = new round, wipe the old round's state
-    if container ~= activeContainer then
-        activeContainer = container
-        resetRoundState()
+    -- Bag full: our own pickup count hit the max, or pickups keep failing.
+    -- Only after we have collected at least one coin this life.
+    if ownCollected > 0 and (ownCollected >= MAX_COINS or missed >= MAX_MISSES) then
+        status = "Bag full"
+        doReset(ownCollected >= MAX_COINS and ("Bag full (" .. ownCollected .. ")") or "Bag full (missed)")
+        return wait(0.5)
+    end
+
+    if not container then
+        status = "No coin container"
+        return wait(0.25)
     end
 
     local char = plr.Character
@@ -389,7 +395,7 @@ local function step()
         noCoinSince = noCoinSince or tick()
         cachedContainer = nil -- may be stale (new round/new map), re-scan
         status = "No coins"
-        if coins > 0 and tick() - noCoinSince > NO_COIN_DELAY then
+        if ownCollected > 0 and tick() - noCoinSince > NO_COIN_DELAY then
             doReset("No coins left")
         end
         return wait(0.1)
@@ -401,7 +407,6 @@ local function step()
     local spd = first and FIRST_SPEED or getSpeed()
     if tween(hrp, coin, spd) then
         first = false
-        lastProgress = tick()
 
         -- Stay on the coin until the server removes it (scaled by ping),
         -- so the touch actually registers before we move on.
@@ -409,23 +414,21 @@ local function step()
         pcall(function() ping = tonumber(GetPingValue()) or 0 end)
         local deadline = tick() + math.min(1.5, 0.3 + (ping / 1000) * 2)
         local cp = coin.Position
-        local got, aborted = false, false
+        local got = false
 
         while tick() < deadline do
-            if not isValid(container) then aborted = true break end -- map deleted = round ended
             if not isValid(coin) or not coin:FindFirstChild("TouchInterest") then
                 got = true
                 break
             end
             if not isValid(hrp) or not isAlive() or not getEnabled() then break end
             hrp.Position = cp
+            heartbeat = tick()
             wait()
         end
 
-        if aborted then
-            resetRoundState()
-        elseif got then
-            collected = collected + 1
+        if got then
+            ownCollected = ownCollected + 1
             missed = 0
         elseif isAlive() and getEnabled() then
             missed = missed + 1
@@ -438,7 +441,7 @@ end
 -- Drawing menu (F1 show/hide, drag the title area to move)
 -- Hotkeys: F2 farm, F3 auto reset, F4/F5 speed -/+
 ------------------------------------------------------------
-local MENU_W, MENU_H, DRAG_H = 240, 210, 40
+local MENU_W, MENU_H, DRAG_H = 240, 236, 40
 local menuX, menuY = 120, 120
 local menuVisible = true
 
@@ -543,6 +546,8 @@ updaters[#updaters + 1] = function() setp(speedText, "Text", tostring(cfg.speed)
 -- Status
 local statusText = label("", 16, 164, C_DIM)
 local hintText = label("F2-F5 hotkeys", 16, 184, C_DIM)
+local evtText = label("", 16, 204, C_DIM)
+updaters[#updaters + 1] = function() setp(evtText, "Text", "Last: " .. lastEvent) end
 updaters[#updaters + 1] = function()
     setp(statusText, "Text", "Status: " .. status)
 end
@@ -690,17 +695,64 @@ task.spawn(function()
             warn("[CoinFarm menu] " .. tostring(err))
             wait(1)
         end
-        wait(0.03)
+        wait(menuVisible and 0.03 or 0.05)
     end
 end)
 
+-- Farm loop. Restartable: if an old copy is stuck, a new generation takes over.
+local farmGen = 0
+local function startFarmLoop()
+    farmGen = farmGen + 1
+    local myGen = farmGen
+    task.spawn(function()
+        while myGen == farmGen do
+            heartbeat = tick()
+            local ok, err = pcall(step)
+            if not ok then
+                warn("[CoinFarm] " .. tostring(err))
+                lastEvent = "err: " .. string.sub(tostring(err), 1, 24)
+                wait(1)
+            end
+        end
+    end)
+end
+startFarmLoop()
+
+-- Watchdog: if the farm loop hasn't ticked in 12s it is stuck or dead, so restart it.
 task.spawn(function()
     while true do
-        local ok, err = pcall(step)
-        if not ok then
-            warn("[CoinFarm] " .. tostring(err))
-            wait(1)
+        wait(2)
+        if tick() - heartbeat > 12 then
+            evt("watchdog restart")
+            heartbeat = tick()
+            cachedContainer = nil
+            first = true
+            noCoinSince = nil
+            missed = 0
+            startFarmLoop()
         end
+    end
+end)
+
+-- Anti-AFK: Roblox kicks after ~20 min without input. Every ANTI_AFK_INTERVAL seconds
+-- send a 1px mouse nudge and an F15 tap, with input routed to the game if unfocused.
+task.spawn(function()
+    while true do
+        wait(ANTI_AFK_INTERVAL)
+        pcall(function()
+            -- Roblox in the background: ask Matcha to route injected input to the game
+            if not isrbxactive() then
+                pcall(setrobloxinput, true)
+                wait(0.1)
+            end
+            mousemoverel(1, 0)
+            wait(0.05)
+            mousemoverel(-1, 0)
+            -- plus a harmless key tap (F15, bound to nothing) in case the mouse nudge isn't counted
+            keypress(0x7E)
+            wait(0.05)
+            keyrelease(0x7E)
+        end)
     end
 end)
 
