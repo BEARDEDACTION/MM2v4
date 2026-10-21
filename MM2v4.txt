@@ -1,16 +1,15 @@
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local plr = Players.LocalPlayer
-
+ 
 local OFFSET = 5          -- studs below the coin to travel at
 local MAX_COINS = 50      -- reset when bag counter reaches this
 local FIRST_SPEED = 999   -- first coin of the round is a fast snap
 local NO_COIN_DELAY = 2   -- seconds with no coins left before auto reset
 local MENU_KEY = 0x70     -- F1
-local ANTI_AFK_INTERVAL = 60 -- seconds between anti-AFK mouse nudges
 local HEALTH_OFFSET = 0x184 -- Humanoid health offset for memory_write (changes when Roblox updates)
 local MAX_MISSES = 2      -- failed pickups in a row = bag is full, reset
-
+ 
 local first = true
 local missed = 0         -- consecutive coins we reached but couldn't collect
 local lastResetTry = 0
@@ -24,24 +23,24 @@ local lastEvent = "-"        -- shown in the menu: the last notable thing the sc
 local wasAlive = false
 local freezeUntil = 0        -- hold still while the game swaps maps / characters
 local heartbeat = tick()     -- updated by the farm loop; the watchdog restarts the loop if it stalls
-
+ 
 -- Settings (changed from the Drawing menu below)
 local cfg = {
     enabled = true,
     autoReset = true,
     speed = 20,
 }
-
+ 
 local function getEnabled() return cfg.enabled end
 local function getAutoReset() return cfg.autoReset end
 local function getSpeed() return cfg.speed end
-
+ 
 ------------------------------------------------------------
 -- Performance helpers
 ------------------------------------------------------------
 local ZERO = Vector3.new(0, 0, 0)
 local function zeroVel(part) part.Velocity = ZERO end
-
+ 
 local lastProps = {}
 local function setp(obj, key, value)
     local c = lastProps[obj]
@@ -54,7 +53,7 @@ local function setp(obj, key, value)
         obj[key] = value
     end
 end
-
+ 
 ------------------------------------------------------------
 -- Farm logic
 ------------------------------------------------------------
@@ -65,7 +64,7 @@ local function isValid(obj)
     local ok, parent = pcall(getParent, obj)
     return ok and parent ~= nil
 end
-
+ 
 -- Uses the "Alive" attribute; falls back to Humanoid health if it isn't set.
 local function isAlive()
     local attr = plr:GetAttribute("Alive")
@@ -76,23 +75,23 @@ local function isAlive()
     local hum = char and char:FindFirstChild("Humanoid")
     return hum ~= nil and hum.Health > 0
 end
-
+ 
 local function dist(a, b)
     local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
-
+ 
 local noclipChar, noclipParts = nil, {}
 local lastNoclip, lastNoclipRebuild = 0, 0
-
+ 
 local function setNoclip()
     local now = tick()
     if now - lastNoclip < 0.2 then return end
     lastNoclip = now
-
+ 
     local char = plr.Character
     if not char then return end
-
+ 
     if char ~= noclipChar or now - lastNoclipRebuild > 2 then
         noclipChar, noclipParts, lastNoclipRebuild = char, {}, now
         for _, part in ipairs(char:GetChildren()) do
@@ -101,23 +100,23 @@ local function setNoclip()
             end
         end
     end
-
+ 
     for _, part in ipairs(noclipParts) do
         pcall(function() part.CanCollide = false end)
     end
 end
-
+ 
 local cachedContainer = nil
 local lastContainer = nil
 local lastScan = 0
-
+ 
 -- Containers we are DONE with (we died / reset / round ended / coins don't register).
 -- A finished map can linger in workspace through the lobby and map voting, so it must
 -- never be farmed again. A brand new map's container is never in this list.
 local function evt(msg)
     lastEvent = string.sub(tostring(msg), 1, 30)
 end
-
+ 
 local usedContainers = {}
 local function isUsed(c)
     for _, u in ipairs(usedContainers) do
@@ -132,14 +131,14 @@ local function markUsed(c, why)
     cachedContainer = nil
     evt("used: " .. tostring(why))
 end
-
+ 
 local function hasCoins(container)
     for _, obj in ipairs(container:GetChildren()) do
         if obj.Name == "Coin_Server" then return true end
     end
     return false
 end
-
+ 
 -- Old maps can linger in workspace, so prefer a CoinContainer that really
 -- has coins in it, and re-scan whenever the cached one goes empty/stale.
 local function findCoinContainer()
@@ -149,7 +148,7 @@ local function findCoinContainer()
         return (isValid(lastContainer) and not isUsed(lastContainer)) and lastContainer or nil
     end
     lastScan = tick()
-
+ 
     local found, fallback = nil, nil
     local ok, kids = pcall(function() return workspace:GetChildren() end)
     if ok and kids then
@@ -173,13 +172,13 @@ local function findCoinContainer()
     cachedContainer, lastContainer = result, result or lastContainer
     return result
 end
-
+ 
 -- Tries Health = 0 first, then the Roblox menu reset, until the character dies.
 local function resetCharacter()
     local char = plr.Character
     if not char then return false end
     local hum = char:FindFirstChildOfClass("Humanoid") or char:FindFirstChild("Humanoid")
-
+ 
     -- 1) Health = 0, plus a direct memory write to the health offset (needs
     --    "Unsafe LuaU Execution Allowed"; works while Roblox is unfocused)
     if hum then
@@ -192,7 +191,7 @@ local function resetCharacter()
     end
     wait(0.5)
     if not isAlive() then return true end
-
+ 
     -- 2) Fall into the void. Needs no keyboard and no window focus (position writes
     --    are what the farming itself uses), so it works while Roblox is in the background.
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -208,7 +207,7 @@ local function resetCharacter()
             if not isAlive() then return true end
         end
     end
-
+ 
     -- 3) Roblox menu reset: Esc, R, Enter. Only when Roblox is the focused window,
     --    otherwise these keys would be typed into whatever app you are looking at.
     if isrbxactive() then
@@ -224,7 +223,7 @@ local function resetCharacter()
     end
     return false
 end
-
+ 
 local function getClosestCoin(container, origin)
     local best, bestDist = nil, math.huge
     for _, obj in ipairs(container:GetChildren()) do
@@ -237,26 +236,26 @@ local function getClosestCoin(container, origin)
     end
     return best
 end
-
+ 
 -- Moves hrp toward coin. Returns true only if we arrived while the coin was still up for grabs.
 local function tween(hrp, coin, spd)
     local sp = hrp.Position
     local tp = coin.Position
     local sx, sy, sz = sp.X, sp.Y - OFFSET, sp.Z
     local tx, ty, tz = tp.X, tp.Y - OFFSET, tp.Z
-
+ 
     local duration = math.max(dist(sp, tp) / spd, 0.05)
     local t0 = tick()
     local lastCheck = 0
-
+ 
     while true do
         local now = tick()
         heartbeat = now
-
+ 
         if not isValid(hrp) or not isValid(coin) or not getEnabled() then
             return false
         end
-
+ 
         -- Slower checks (every 0.1s): alive state and coin still up for grabs
         if now - lastCheck > 0.1 then
             lastCheck = now
@@ -266,10 +265,10 @@ local function tween(hrp, coin, spd)
             end
             pcall(zeroVel, hrp)
         end
-
+ 
         local alpha = (now - t0) / duration
         if alpha >= 1 then break end
-
+ 
         setNoclip()
         hrp.Position = Vector3.new(
             sx + (tx - sx) * alpha,
@@ -278,14 +277,14 @@ local function tween(hrp, coin, spd)
         )
         wait()
     end
-
+ 
     if isValid(hrp) and isValid(coin) and coin:FindFirstChild("TouchInterest") then
         hrp.Position = coin.Position
         return true
     end
     return false
 end
-
+ 
 -- Resets the character. Retries every 3s until the character actually dies.
 local function doReset(reason)
     if not getAutoReset() or tick() - lastResetTry < 3 then
@@ -302,14 +301,14 @@ local function doReset(reason)
     warn("[CoinFarm] Reset failed, will retry")
     return false
 end
-
+ 
 local function step()
     if not getEnabled() then
         noCoinSince = nil
         status = "Disabled"
         return wait(0.25)
     end
-
+ 
     if not isAlive() then
         markUsed(lastContainerSeen, "dead")
         wasAlive = false
@@ -317,22 +316,22 @@ local function step()
         status = "Dead"
         return wait(0.25)
     end
-
+ 
     if not wasAlive then
         wasAlive = true
         freezeUntil = tick() + 2
         evt("alive, settling")
     end
-
+ 
     -- New character (new round / respawn): forget the old life
     if plr.Character ~= lifeChar then
         lifeChar = plr.Character
         missed, ownCollected = 0, 0
         first, noCoinSince, cachedContainer = true, nil, nil
     end
-
+ 
     local container = findCoinContainer()
-
+ 
     -- Container changed or vanished = old map deleted / new one loaded: clean slate
     if container ~= lastContainerSeen then
         lastContainerSeen = container
@@ -343,13 +342,13 @@ local function step()
             evt("new map, settling")
         end
     end
-
+ 
     -- Give the game a moment after a map swap / respawn before touching anything
     if tick() < freezeUntil then
         status = "Settling"
         return wait(0.2)
     end
-
+ 
     -- Reached coins twice but picked up nothing this life: not live coins (old map
     -- left in the lobby). Three strikes, since a new map's coins can take a few
     -- seconds to go live.
@@ -369,7 +368,7 @@ local function step()
         end
         return wait(0.25)
     end
-
+ 
     -- Bag full: our own pickup count hit the max, or pickups keep failing.
     -- Only after we have collected at least one coin this life.
     if ownCollected > 0 and (ownCollected >= MAX_COINS or missed >= MAX_MISSES) then
@@ -377,19 +376,19 @@ local function step()
         doReset(ownCollected >= MAX_COINS and ("Bag full (" .. ownCollected .. ")") or "Bag full (missed)")
         return wait(0.5)
     end
-
+ 
     if not container then
         status = "No coin container"
         return wait(0.25)
     end
-
+ 
     local char = plr.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then
         status = "No character"
         return wait(0.25)
     end
-
+ 
     local coin = getClosestCoin(container, hrp.Position)
     if not coin then
         noCoinSince = noCoinSince or tick()
@@ -401,13 +400,13 @@ local function step()
         return wait(0.1)
     end
     noCoinSince = nil
-
+ 
     status = "Farming"
     setNoclip()
     local spd = first and FIRST_SPEED or getSpeed()
     if tween(hrp, coin, spd) then
         first = false
-
+ 
         -- Stay on the coin until the server removes it (scaled by ping),
         -- so the touch actually registers before we move on.
         local ping = 0
@@ -415,7 +414,7 @@ local function step()
         local deadline = tick() + math.min(1.5, 0.3 + (ping / 1000) * 2)
         local cp = coin.Position
         local got = false
-
+ 
         while tick() < deadline do
             if not isValid(coin) or not coin:FindFirstChild("TouchInterest") then
                 got = true
@@ -426,7 +425,7 @@ local function step()
             heartbeat = tick()
             wait()
         end
-
+ 
         if got then
             ownCollected = ownCollected + 1
             missed = 0
@@ -436,7 +435,7 @@ local function step()
     end
     wait()
 end
-
+ 
 ------------------------------------------------------------
 -- Drawing menu (F1 show/hide, drag the title area to move)
 -- Hotkeys: F2 farm, F3 auto reset, F4/F5 speed -/+
@@ -444,7 +443,7 @@ end
 local MENU_W, MENU_H, DRAG_H = 240, 236, 40
 local menuX, menuY = 120, 120
 local menuVisible = true
-
+ 
 local C_SHADOW = Color3.fromRGB(0, 0, 0)
 local C_BG     = Color3.fromRGB(22, 22, 29)
 local C_ROW    = Color3.fromRGB(33, 33, 44)
@@ -455,12 +454,12 @@ local C_TEXT   = Color3.fromRGB(238, 238, 245)
 local C_DIM    = Color3.fromRGB(150, 150, 168)
 local C_ON     = Color3.fromRGB(70, 200, 120)
 local C_OFF    = Color3.fromRGB(205, 75, 85)
-
+ 
 local elements = {}   -- { obj, rx, ry }
 local updaters = {}   -- run every frame while visible
 local hits = {}       -- clickable regions
 local warnedProps = {}
-
+ 
 local function draw(kind, rx, ry, props, z)
     local d = Drawing.new(kind)
     pcall(function() d.Transparency = 1 end)
@@ -482,26 +481,26 @@ local function draw(kind, rx, ry, props, z)
     elements[#elements + 1] = e
     return d, e
 end
-
+ 
 local function rect(rx, ry, w, h, color, corner, z, transparency)
     return draw("Square", rx, ry, {
         Size = Vector2.new(w, h), Filled = true, Color = color,
         Corner = corner or 0, Transparency = transparency or 1,
     }, z)
 end
-
+ 
 local function label(text, rx, ry, color)
     return draw("Text", rx, ry, { Text = text, Color = color or C_TEXT, Outline = false, Center = false }, 6)
 end
-
+ 
 local function centerText(text, rx, ry, color)
     return draw("Text", rx, ry, { Text = text, Color = color or C_TEXT, Outline = false, Center = true }, 6)
 end
-
+ 
 local function hit(rx, ry, w, h, fn, obj, base, hover)
     hits[#hits + 1] = { rx = rx, ry = ry, w = w, h = h, fn = fn, obj = obj, base = base, hover = hover }
 end
-
+ 
 local function addToggle(text, ry, key)
     rect(10, ry, MENU_W - 20, 30, C_ROW, 8, 2)
     label(text, 22, ry + 8)
@@ -517,17 +516,17 @@ local function addToggle(text, ry, key)
         knobE.rx = tx + (on and 31 or 9)
     end
 end
-
+ 
 -- Shadow, panel, title
 rect(3, 5, MENU_W, MENU_H, C_SHADOW, 14, 0, 0.35)
 rect(0, 0, MENU_W, MENU_H, C_BG, 14, 1)
 label("Coin Farm", 16, 11, C_TEXT)
 label("F1", MENU_W - 32, 11, C_DIM)
 rect(16, 34, MENU_W - 32, 2, C_ACCENT, 1, 2)
-
+ 
 addToggle("Farm", 46, "enabled")
 addToggle("Auto Reset", 82, "autoReset")
-
+ 
 -- Speed row
 rect(10, 118, MENU_W - 20, 30, C_ROW, 8, 2)
 label("Speed", 22, 126)
@@ -542,7 +541,7 @@ end
 hit(MENU_W - 112, 123, 26, 20, function() changeSpeed(-5) end, minus, C_BTN, C_BTN_HI)
 hit(MENU_W - 44, 123, 26, 20, function() changeSpeed(5) end, plus, C_BTN, C_BTN_HI)
 updaters[#updaters + 1] = function() setp(speedText, "Text", tostring(cfg.speed)) end
-
+ 
 -- Status
 local statusText = label("", 16, 164, C_DIM)
 local hintText = label("F2-F5 hotkeys", 16, 184, C_DIM)
@@ -551,7 +550,7 @@ updaters[#updaters + 1] = function() setp(evtText, "Text", "Last: " .. lastEvent
 updaters[#updaters + 1] = function()
     setp(statusText, "Text", "Status: " .. status)
 end
-
+ 
 -- Cursor dot (confirms the mouse position is being read)
 local cursor = Drawing.new("Circle")
 pcall(function()
@@ -562,7 +561,7 @@ pcall(function()
     cursor.ZIndex = 20
 end)
 cursor.Visible = false
-
+ 
 local function setMenuVisible(state)
     for _, e in ipairs(elements) do
         e.obj.Visible = state
@@ -572,7 +571,7 @@ local function setMenuVisible(state)
         lastProps[cursor] = nil
     end
 end
-
+ 
 local function layout()
     for _, e in ipairs(elements) do
         local x, y = menuX + e.rx, menuY + e.ry
@@ -582,7 +581,7 @@ local function layout()
         end
     end
 end
-
+ 
 local function getMouse()
     local ok, pos = pcall(function() return UIS:GetMouseLocation() end)
     if ok and pos then return pos.X, pos.Y end
@@ -593,34 +592,34 @@ local function getMouse()
     if ok2 and x and y then return x, y end
     return nil, nil
 end
-
+ 
 local function inRect(mx, my, x, y, w, h)
     return mx >= x and mx <= x + w and my >= y and my <= y + h
 end
-
+ 
 local hotkeys = {
     { 0x71, function() cfg.enabled = not cfg.enabled end },
     { 0x72, function() cfg.autoReset = not cfg.autoReset end },
     { 0x73, function() changeSpeed(-5) end },
     { 0x74, function() changeSpeed(5) end },
 }
-
+ 
 local wasF1, wasDown, dragging = false, false, false
 local wasKey = {}
 local dragOX, dragOY = 0, 0
 local warnedMouse = false
 local lastMX, lastMY = -1, -1
-
+ 
 local function menuStep()
     local active = isrbxactive()
-
+ 
     local f1 = active and iskeypressed(MENU_KEY)
     if f1 and not wasF1 then
         menuVisible = not menuVisible
         setMenuVisible(menuVisible)
     end
     wasF1 = f1 and true or false
-
+ 
     if active then
         for _, hk in ipairs(hotkeys) do
             local pressed = iskeypressed(hk[1]) and true or false
@@ -628,14 +627,14 @@ local function menuStep()
             wasKey[hk[1]] = pressed
         end
     end
-
+ 
     if not menuVisible then
         dragging = false
         return
     end
-
+ 
     for _, fn in ipairs(updaters) do fn() end
-
+ 
     local mx, my = getMouse()
     if mx then
         if mx ~= lastMX or my ~= lastMY then
@@ -652,10 +651,10 @@ local function menuStep()
             warn("[CoinFarm] Could not read mouse position; use F2-F5 hotkeys.")
         end
     end
-
+ 
     -- Only accept clicks while the Roblox window is focused
     local down = active and (mx ~= nil) and ismouse1pressed() and true or false
-
+ 
     -- hover highlight
     for _, h in ipairs(hits) do
         if h.obj then
@@ -663,7 +662,7 @@ local function menuStep()
             setp(h.obj, "Color", over and h.hover or h.base)
         end
     end
-
+ 
     if down and not wasDown then
         if inRect(mx, my, menuX, menuY, MENU_W, DRAG_H) then
             dragging = true
@@ -681,13 +680,13 @@ local function menuStep()
     end
     if not down then dragging = false end
     wasDown = down
-
+ 
     layout()
 end
-
+ 
 layout()
 setMenuVisible(true)
-
+ 
 task.spawn(function()
     while true do
         local ok, err = pcall(menuStep)
@@ -698,7 +697,7 @@ task.spawn(function()
         wait(menuVisible and 0.03 or 0.05)
     end
 end)
-
+ 
 -- Farm loop. Restartable: if an old copy is stuck, a new generation takes over.
 local farmGen = 0
 local function startFarmLoop()
@@ -717,7 +716,7 @@ local function startFarmLoop()
     end)
 end
 startFarmLoop()
-
+ 
 -- Watchdog: if the farm loop hasn't ticked in 12s it is stuck or dead, so restart it.
 task.spawn(function()
     while true do
@@ -733,27 +732,5 @@ task.spawn(function()
         end
     end
 end)
-
--- Anti-AFK: Roblox kicks after ~20 min without input. Every ANTI_AFK_INTERVAL seconds
--- send a 1px mouse nudge and an F15 tap, with input routed to the game if unfocused.
-task.spawn(function()
-    while true do
-        wait(ANTI_AFK_INTERVAL)
-        pcall(function()
-            -- Roblox in the background: ask Matcha to route injected input to the game
-            if not isrbxactive() then
-                pcall(setrobloxinput, true)
-                wait(0.1)
-            end
-            mousemoverel(1, 0)
-            wait(0.05)
-            mousemoverel(-1, 0)
-            -- plus a harmless key tap (F15, bound to nothing) in case the mouse nudge isn't counted
-            keypress(0x7E)
-            wait(0.05)
-            keyrelease(0x7E)
-        end)
-    end
-end)
-
+ 
 notify("Coin farm loaded. F1 hides/shows the menu.", "Coin Farm", 4)
